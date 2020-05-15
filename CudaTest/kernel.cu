@@ -16,65 +16,76 @@
 using namespace cv;
 namespace cg = cooperative_groups;
 
-cudaError_t lbpMultiscaleCuda(uint8_t* const c, const uint8_t* const a);
+
+extern "C"
+cudaError_t livenessCuda(uint8_t* const c, const uint8_t* const a);
+
 
 template<typename T>
 __device__ inline T my_abs_dif(T a, T b) {
     return a > b ? (a - b) : (b - a);
 }
 
-__constant__ int8_t d[16]; 
-__global__ void lbpKernel(uint8_t* const c, const uint8_t* const a, uint32_t w, uint32_t h, uint32_t r)
+__constant__ int8_t d[3][32]; 
+
+
+
+__global__ 
+void lbpMsKernel(uint8_t* const c, const uint8_t* const a, uint32_t w, uint32_t h, uint32_t t, uint32_t x = 0, uint32_t y = 0)
 {
+    uint16_t p, r;
+    switch (t) { // LBP neigbours/range
+        case 0: {p = 8  ; r = 1; break; }
+        case 1: {p = 8  ; r = 2; break; }
+        case 2: {p = 16 ; r = 2; break; }
+        default: return;
+    }
 
     uint32_t j = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t i = blockIdx.y * blockDim.y + threadIdx.y;
-
 
     int32_t prev = -1;
     uint8_t U = 0;
     uint8_t D = 0;
     uint8_t M = 0;
     uint16_t temp = 0;
+    uint32_t pos = (i + y) * w + (j + x);
 
             uint16_t    pc   = 0;
-    const   uint8_t     pa   = a[i * w + j];
+    const   uint8_t     pa   = a[pos];
 
-    c[i * w + j] = pa;
+    c[pos] = pa;
    // return;
 
-    if (i > r && j > r && i + r < h - 1 && j + r < w - 1) {
+    if (i+y > r-1 && j+x > r-1 && i+y < h - r && j+x < w - r) {
 
-        for(uint8_t ii = 0; ii < 16; ii+=2){
-            temp = my_abs_dif(pa, a[(i + d[ii]) * w + (j + d[ii + 1])]);
-            
+        for (uint8_t ii = 0; ii < p<<1; ii += 2) {
+            temp = my_abs_dif(pa, a[(i+y + d[t][ii]) * w + (j+x + d[t][ii + 1])]);
+
             if (M < temp) {
-                D = 7-(ii>>1);
+                D = 7 - (ii >> 1);
                 M = temp;
             }
         }
 
-        for (uint8_t ii = 0; ii < 16; ii+=2) {
+        for (uint8_t ii = 0; ii < p<<1; ii += 2) {
             pc <<= 1;
-            pc |= (a[(i + d[ii]) * w + (j + d[ii + 1])] > pa);
+            pc |= (a[(i+y + d[t][ii]) * w + (j+x + d[t][ii + 1])] > pa);
 
             if (prev > -1)
                 U += (pc ^ prev) & 1;
             prev = pc;
         }
 
-        
-        if (U + (pc ^ (pc >> 7)) > 2) 
-            c[i * w + j] = 9;
-            
-        else {
-            temp = (pc >> D) | (pc << (8 - D));
 
-            c[i * w + j] = temp;
+        if (U + (pc ^ (pc >> (p-1))) > 2)
+            c[pos] = p+1;
+
+        else {
+            temp = (pc >> D) | (pc << (p - D));
+            c[pos] = temp;
         }
     }
-
-
 }
 
 void lbpKernelCpu(uint8_t* const c, const uint8_t* const a, uint32_t w, uint32_t h, uint32_t r) {
@@ -128,42 +139,40 @@ void lbpKernelCpu(uint8_t* const c, const uint8_t* const a, uint32_t w, uint32_t
 }
 
 
-__global__ void histogramKernel(uint32_t H[256], uint8_t* a, uint32_t w) {
-    uint32_t l_hist = 0;
+__global__
+void histogramKernel(uint32_t H[256], uint8_t* a, uint32_t w, uint32_t h, uint32_t t, uint32_t x = 0, uint32_t y = 0) {
+    uint32_t r = 1 + (t > 0);
 
-    uint32_t j = threadIdx.x;
-    uint32_t i = threadIdx.y;
-    uint16_t pos = i * (w>>2) + j;
+    uint32_t j = threadIdx.x + blockIdx.x * blockDim.x;
+    uint32_t i = threadIdx.y + blockIdx.y * blockDim.y;
+    uint16_t pos;
 
+    //ignore LBP bounds
+    if (i + y < r || j + x < r || i + y > h - 1 - r || j + x > w - 1 - r)
+        return;
 
-    uint32_t temp = ((uint32_t*)a)[pos + blockIdx.y * blockDim.y * blockDim.x];
+    pos = (i + y) * w + (j + x);
+    uint8_t temp = a[pos];
 
-
-#pragma unroll
-    for (int i = 0; i < 4; i++) {
-        l_hist <<= 8;
-        l_hist |= (temp & 0xFF);
-        temp >>= 8;
-    }
-  
-#pragma unroll
-    for (int i = 0; i < 4; i++) {
-        atomicAdd(H + (l_hist & 0xFF), 1);
-        l_hist >>= 8;
-    }
+    atomicAdd(H + temp, 1);
 }
 
-void cpu_hist(uint32_t H[256], const uint8_t* const a, int w, int h) {
+extern "C" 
+void cpu_hist(uint32_t H[256], const uint8_t* const a, int w, int h, int r) {
 
-    for(int i=0; i<h; i++)
-        for (int j = 0; j < w; j++) 
+    for(int i = r; i < h-r; i++)
+        for (int j = r; j < w-r; j++) 
             H[a[i * w + j]]++;
 }
 
-cudaError_t lbpMultiscaleCuda(uint8_t* const c, const uint8_t* const a)
+extern "C" 
+cudaError_t livenessCuda(uint8_t* const c, const uint8_t* const a)
 {
 
-    int8_t d_temp[16] = { 0, -1, 1, -1, 1, 0, 1, 1, 0, 1, -1, 1, -1, 0, -1, -1 };
+    int8_t d_temp[3][32] = { { 0, -1, 1, -1, 1, 0, 1, 1, 0, 1, -1, 1, -1, 0, -1, -1 },
+                             { 0, -2, 1, -1, 2, 0, 1, 1, 0, 2, -1, 1, -2, 0, -1, -1 },
+                             { 0, -2, 1, -2, 2, -2, 2, -1, 2, 0, 2, 1, 2, 2, 1, 2, 0, 2, -1, 2, -2, 2, -2, 1, -2, 0, -2, -1, -2, -2, -2, -1} 
+                            };
     cudaMemcpyToSymbol(d, d_temp, 16);
     cudaMemcpyFromSymbol(d_temp, d, 16);
 
@@ -171,9 +180,15 @@ cudaError_t lbpMultiscaleCuda(uint8_t* const c, const uint8_t* const a)
         h = 64;
     uint16_t size = w * h;
 
-    dim3 numThreads(16, 32);
-    dim3 numBlocks1(4, 2);
-    dim3 numBlocks2(1, 2);
+    dim3 numThreads_ms(16, 32);
+    dim3 numBlocks_ms(4, 2);
+
+    dim3 numThreads_81(22, 22);
+    dim3 numBlocks_81(1, 1);
+   
+    dim3 numBlocks_hist(4, 2);
+    dim3 numThreads_hist(16, 32);
+
 
     uint8_t* dev_a = 0;
     uint8_t* dev_c = 0;
@@ -216,44 +231,48 @@ cudaError_t lbpMultiscaleCuda(uint8_t* const c, const uint8_t* const a)
 
     StopWatchInterface* timer = NULL;
 
-
     sdkCreateTimer(&timer);
     sdkResetTimer(&timer);
 
 
-    checkCudaErrors(cudaDeviceSynchronize());
+    
 
+    uint32_t hist[256 * 13], *dev_hist;
+    cudaMalloc(&dev_hist, (256 * 11) << 2);
+
+    memset(hist, 0, sizeof(hist));
+    cudaMemset(dev_hist, 0, sizeof(hist));
+
+    checkCudaErrors(cudaDeviceSynchronize());
     sdkStartTimer(&timer);
     cudaEventRecord(start, 0);
     
-    uint32_t hist[256], *d_hist, hist2[256];
-    cudaMalloc(&d_hist, 256<<2);
+    
+    for (int i = 0; i < 9; i++) {
+        lbpMsKernel <<< numBlocks_81, numThreads_81 >>>(dev_c, dev_a, w, h, 0, 21*(i%3), 21*(i/3));
+        histogramKernel <<< numBlocks_81, numThreads_81 >>> (dev_hist + (i<<8), dev_c, w, h, 0, 21*(i%3), 21*(i/3));
+    }
+    
+    lbpMsKernel <<< numBlocks_ms, numThreads_ms >> > (dev_c, dev_a, w, h, 1);
+    histogramKernel <<< numBlocks_hist, numThreads_hist >> > (dev_hist + (9 << 8), dev_c, w, h, 1);
 
-    memset(hist , 0, sizeof(hist ));
-    memset(hist2, 0, sizeof(hist2));
-    cudaMemset(d_hist, 0, sizeof(hist));
+    lbpMsKernel <<< numBlocks_ms, numThreads_ms >> > (dev_c, dev_a, w, h, 2);
+    histogramKernel <<< numBlocks_hist, numThreads_hist >> > (dev_hist + (10 << 8), dev_c, w, h, 2);
 
-    lbpKernel <<< numBlocks1, numThreads >>> (dev_c, dev_a, w, h, 0);
+    cudaEventRecord(stop, 0);
+    sdkStopTimer(&timer);
+    checkCudaErrors(cudaDeviceSynchronize());
+
     cudaStatus = cudaMemcpy(c, dev_c, size, cudaMemcpyDeviceToHost);
     if (cudaStatus != cudaSuccess) {
         fprintf(stdout, "cudaMalloc failed!");
         goto Error;
     }
 
-    histogramKernel << <numBlocks2, numThreads >> > (d_hist, dev_c, w);
-    checkCudaErrors(cudaDeviceSynchronize());
     
-    cudaEventRecord(stop, 0);
-    sdkStopTimer(&timer);
-
+    cudaMemcpy(hist, dev_hist, (256*11) << 2, cudaMemcpyDeviceToHost);
+    cpu_hist(hist + (256 * 11), c, w, h, 2);
     
-
-    
-    cudaMemcpy(hist, d_hist, 256 << 2, cudaMemcpyDeviceToHost);
-    
-    cudaFree(d_hist);
-
-
     //checkCudaErrors(cudaDeviceSynchronize());
     
 
@@ -282,12 +301,16 @@ cudaError_t lbpMultiscaleCuda(uint8_t* const c, const uint8_t* const a)
 Error:
     cudaFree(dev_c);
     cudaFree(dev_a);
+    cudaFree(dev_hist);
+
+    free(hist);
 
     return cudaStatus;
 }
 
 
-cudaError_t lbpMultiscaleCudaCpu(uint8_t* const c, const uint8_t* const a)
+extern "C" 
+cudaError_t livenessCudaCpu(uint8_t* const c, const uint8_t* const a)
 {
 
     int8_t d_temp[16] = { 0, -1, 1, -1, 1, 0, 1, 1, 0, 1, -1, 1, -1, 0, -1, -1 };
@@ -403,7 +426,7 @@ int main(int argc, char* argv[]) {
     }*/
 
 
-    lbpMultiscaleCuda(pdst, pimg);
+    livenessCuda(pdst, pimg);
     
     return 0;
 }
